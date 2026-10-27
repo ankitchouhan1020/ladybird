@@ -80,6 +80,12 @@ public:
     }
 
     virtual bool should_coordinate_browser_process() const override { return false; }
+    virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
+
+    void set_port_app(LbApp* app) { m_port_app = app; }
+
+private:
+    LbApp* m_port_app { nullptr };
 };
 
 // The bitmap members are protected, so a subclass is the sanctioned access path. This is current_paintable() from
@@ -134,6 +140,10 @@ public:
     }
 
 private:
+    // HeadlessWebView otherwise creates an internal child that the native host never learns about. UI-level requests
+    // such as Command-click must fall through to PortApplication::open_blank_new_tab, which registers and reports it.
+    virtual WebView::ViewImplementation* create_view_for_new_tab_or_window(WebView::IsPrivate) override { return nullptr; }
+
     PortWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size)
         : HeadlessWebView(move(theme), window_size)
     {
@@ -199,6 +209,7 @@ struct LbApp {
 
     // Ids are never reused: a popup's id must not collide with a tab the host is still holding a surface for.
     uint64_t next_tab_id { 1 };
+    uint64_t active_tab_id { 0 };
 
     // One counter for every request group, so a stale answer is detectable by id alone.
     uint64_t next_request_id { 0 };
@@ -720,6 +731,42 @@ void install_group_callbacks(LbApp& app, uint64_t id, PortWebView& view)
     };
 }
 
+uint64_t create_owned_tab(LbApp& app)
+{
+    auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv,
+        app.dark_theme ? "Dark.ini"sv : "Default.ini"sv);
+    auto theme = Gfx::load_system_theme(theme_path.string());
+    if (theme.is_error()) {
+        warnln("create_owned_tab: unable to load the system theme: {}", theme.error());
+        return 0;
+    }
+
+    auto view = PortWebView::create(theme.release_value(), { 1024, 768 });
+    auto id = app.next_tab_id++;
+    install_core_callbacks(app, id, *view);
+    install_group_callbacks(app, id, *view);
+
+    auto tab = adopt_own(*new Tab {});
+    tab->id = id;
+    tab->own_view = move(view);
+    app.tabs.append(move(tab));
+    return id;
+}
+
+Optional<WebView::ViewImplementation&> PortApplication::open_blank_new_tab(Web::HTML::ActivateTab activate_tab) const
+{
+    if (!m_port_app)
+        return {};
+    auto new_id = create_owned_tab(*m_port_app);
+    auto* tab = find_tab(m_port_app, new_id);
+    if (!tab)
+        return {};
+    if (auto* callback = m_port_app->page_callbacks.on_new_tab)
+        callback(m_port_app->callbacks.context, m_port_app->active_tab_id, new_id,
+            activate_tab == Web::HTML::ActivateTab::Yes ? 1 : 0, 0);
+    return *tab->view();
+}
+
 // Registers a view the engine created for a page. Ownership is the caller's to hand over; this only learns the id and
 // wires the callbacks, so a popup behaves exactly like a tab the host asked for.
 uint64_t register_existing_view(LbApp& app, PortWebView* view)
@@ -792,6 +839,7 @@ LbApp* LbAppCreate(char const* argv0, LbCallbacks const* callbacks)
 
     auto app = new LbApp {};
     app->application = application.release_value();
+    app->application->set_port_app(app);
     if (callbacks)
         app->callbacks = *callbacks;
     return app;
@@ -881,32 +929,13 @@ void LbAppDestroy(LbApp* app)
 
 uint64_t LbTabCreate(LbApp* app)
 {
-    if (!app)
-        return 0;
+    return app ? create_owned_tab(*app) : 0;
+}
 
-    // The theme is fixed for a headless view's lifetime: HeadlessWebView::system_theme() hands out the buffer its
-    // constructor was given, so this is the only moment to choose it.
-    auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv,
-        app->dark_theme ? "Dark.ini"sv : "Default.ini"sv);
-    auto theme = Gfx::load_system_theme(theme_path.string());
-    if (theme.is_error()) {
-        warnln("LbTabCreate: unable to load the system theme: {}", theme.error());
-        return 0;
-    }
-
-    auto view = PortWebView::create(theme.release_value(), { 1024, 768 });
-    auto id = app->next_tab_id++;
-
-    install_core_callbacks(*app, id, *view);
-
-    install_group_callbacks(*app, id, *view);
-
-    auto tab = adopt_own(*new Tab {});
-    tab->id = id;
-    tab->own_view = move(view);
-    tab->device_pixel_ratio = 1.0;
-    app->tabs.append(move(tab));
-    return id;
+void LbAppSetActiveTab(LbApp* app, uint64_t tab_id)
+{
+    if (app && find_tab(app, tab_id))
+        app->active_tab_id = tab_id;
 }
 
 void LbTabAnswerAlert(LbApp* app, uint64_t tab)
@@ -1358,7 +1387,7 @@ int LbTabCanTraverseHistory(LbApp* app, uint64_t tab_id, int32_t delta)
     return action.enabled() ? 1 : 0;
 }
 
-void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y)
+void LbTabSendMouseWithModifiers(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y, uint32_t modifiers)
 {
     auto* tab = find_tab(app, tab_id);
     if (!tab)
@@ -1391,6 +1420,7 @@ void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x
         .screen_position = position,
         .button = static_cast<Web::UIEvents::MouseButton>(button),
         .buttons = static_cast<Web::UIEvents::MouseButton>(buttons),
+        .modifiers = static_cast<Web::UIEvents::KeyModifier>(modifiers),
         .wheel_delta_y = wheel_delta_y,
         .browser_data = nullptr,
     };
@@ -1409,6 +1439,11 @@ void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x
     }
 
     tab->view()->enqueue_input_event(move(event));
+}
+
+void LbTabSendMouse(LbApp* app, uint64_t tab_id, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y)
+{
+    LbTabSendMouseWithModifiers(app, tab_id, type, x, y, button, buttons, click_count, wheel_delta_y, 0);
 }
 
 void LbTabSendKey(LbApp* app, uint64_t tab_id, int32_t key, uint32_t code_point, uint32_t modifiers, int is_key_down)

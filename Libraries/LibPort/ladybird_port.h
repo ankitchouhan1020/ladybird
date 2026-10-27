@@ -197,7 +197,7 @@ typedef struct LbPickerCallbacks {
 
     // A <select> wants its dropdown at (x, y) — CSS pixels, the same space as LbTabSendMouse — at least
     // `minimum_width` CSS pixels wide. `items_json` is an array in document order, matching Web::HTML::SelectItem:
-    //   {"type":"option","id":N,"label":"...","enabled":bool}   — N is the id to pass back in LbTabAnswerSelectDropdown
+    //   {"type":"option","id":N,"label":"...","enabled":bool,"selected":bool} — N is the id to pass back in LbTabAnswerSelectDropdown
     //   {"type":"separator"}                                     — no other members
     //   {"type":"group","label":"...","items":[option...]}     — a group's items are options only, never nested groups
     // Answer with LbTabAnswerSelectDropdown.
@@ -275,6 +275,9 @@ void LbAppDestroy(LbApp* app);
 
 uint64_t LbTabCreate(LbApp* app);
 
+// Names the tab receiving native input. UI-initiated new-tab requests such as Command-click use it as their parent.
+void LbAppSetActiveTab(LbApp* app, uint64_t tab);
+
 // Destroys one tab and its engine page. The host must stop asking for its surface first: a get-surface after this
 // returns 0 rather than a stale frame, but presenting a frame that arrived before the call would be a use-after-free.
 // Every other tab is unaffected, and the app outlives all of them.
@@ -347,7 +350,11 @@ typedef enum LbMouseEventType {
 
 // `button` is the button this event concerns; `buttons` is every button held during it. A button-up carries the still-held
 // set, which is why they are separate arguments. For a wheel event the buttons are ignored and `wheel_delta_y` is the
-// pixel delta (positive scrolls down).
+// pixel delta (positive scrolls down). `modifiers` is the Web::UIEvents::KeyModifier bitmask; without it modifier-click
+// navigation such as Command-click cannot work.
+void LbTabSendMouseWithModifiers(LbApp* app, uint64_t tab, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y, uint32_t modifiers);
+
+// Compatibility entry point for hosts built before mouse modifiers crossed the boundary.
 void LbTabSendMouse(LbApp* app, uint64_t tab, LbMouseEventType type, double x, double y, LbMouseButton button, LbMouseButton buttons, int32_t click_count, double wheel_delta_y);
 
 // A single key transition. `key` is a Web::UIEvents::KeyCode ordinal; the host passes `LbKeyInvalid` (0) when it only has

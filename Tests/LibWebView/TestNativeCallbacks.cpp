@@ -38,6 +38,34 @@
 namespace {
 
 int failures { 0 };
+uint64_t opened_parent_tab { 0 };
+uint64_t opened_new_tab { 0 };
+int opened_activate_tab { -1 };
+size_t loads_finished { 0 };
+size_t paints_ready { 0 };
+bool saw_command_modifier { false };
+
+void did_finish_load(void*, uint64_t, char const*, size_t)
+{
+    ++loads_finished;
+}
+
+void did_become_ready_to_paint(void*, uint64_t)
+{
+    ++paints_ready;
+}
+
+void did_change_title(void*, uint64_t, char const* title, size_t length)
+{
+    saw_command_modifier = StringView { title, length } == "command:true"sv;
+}
+
+void did_open_new_tab(void*, uint64_t parent_tab, uint64_t new_tab, int activate_tab, int)
+{
+    opened_parent_tab = parent_tab;
+    opened_new_tab = new_tab;
+    opened_activate_tab = activate_tab;
+}
 
 void check(bool condition, StringView what)
 {
@@ -84,10 +112,14 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     (void)arguments;
 
-    // No host callbacks at all: every request the engine blocks on must still be answered by the shim.
+    // No host request callbacks: every request the engine blocks on must still be answered by the shim.
     // NB: LbAppCreate constructs the application itself, so this probe must not create one first -- Application's
     // constructor VERIFYs that it is the only instance.
-    auto* port = LbAppCreate("TestNativeCallbacks", nullptr);
+    LbCallbacks core_callbacks {};
+    core_callbacks.on_ready_to_paint = did_become_ready_to_paint;
+    core_callbacks.on_load_finish = did_finish_load;
+    core_callbacks.on_title_change = did_change_title;
+    auto* port = LbAppCreate("TestNativeCallbacks", &core_callbacks);
     if (!port) {
         outln("FAIL: LbAppCreate returned null");
         return 1;
@@ -131,7 +163,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
 
     outln("");
-    outln("PHASE 3: a tab with no host callbacks still loads, and answers its own requests");
+    outln("PHASE 3: a tab with no host request callbacks still loads, and answers its own requests");
     {
         auto tab = LbTabCreate(port);
         check(tab != 0, "LbTabCreate succeeds with no host callbacks registered"sv);
@@ -167,6 +199,47 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
 
     outln("");
+    outln("PHASE 4: Command-click creates a registered background tab");
+    {
+        auto page = page_group(sizeof(LbPageCallbacks));
+        page.on_new_tab = did_open_new_tab;
+        check(LbAppSetPageCallbacks(port, &page) == 1, "the new-tab callback registers"sv);
+
+        auto tab = LbTabCreate(port);
+        check(tab != 0, "the Command-click parent tab is created"sv);
+        LbAppSetActiveTab(port, tab);
+        LbTabSetViewport(port, tab, 800, 600, 1.0);
+        auto initial_loads = loads_finished;
+        auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(20);
+        while (MonotonicTime::now() < deadline && loads_finished == initial_loads)
+            LbAppPump(port);
+
+        auto page_url = "data:text/html,%3Cbody%20style%3D%27margin%3A0%27%3E%3Ca%20href%3D%27https%3A%2F%2Fexample.com%2F%27%20style%3D%27display%3Ablock%3Bwidth%3A100vw%3Bheight%3A100vh%27%3Ego%3C%2Fa%3E%3Cscript%3EaddEventListener%28%27mousedown%27%2Ce%3D%3Edocument.title%3D%27command%3A%27%2Be.metaKey%29%3C%2Fscript%3E%3C%2Fbody%3E"sv;
+        auto loads_before = loads_finished;
+        auto paints_before = paints_ready;
+        LbTabLoad(port, tab, page_url.characters_without_null_termination(), page_url.length());
+
+        deadline = MonotonicTime::now() + AK::Duration::from_seconds(20);
+        while (MonotonicTime::now() < deadline && (loads_finished == loads_before || paints_ready == paints_before))
+            LbAppPump(port);
+
+        constexpr uint32_t platform_control_on_macos = 1u << 3;
+        LbTabSendMouseWithModifiers(port, tab, LbMouseEventDown, 20, 20, LbMouseButtonPrimary, LbMouseButtonPrimary, 1, 0, platform_control_on_macos);
+        LbTabSendMouseWithModifiers(port, tab, LbMouseEventUp, 20, 20, LbMouseButtonPrimary, LbMouseButtonNone, 1, 0, platform_control_on_macos);
+        deadline = MonotonicTime::now() + AK::Duration::from_seconds(20);
+        while (MonotonicTime::now() < deadline && opened_new_tab == 0)
+            LbAppPump(port);
+
+        check(saw_command_modifier, "Command-click reaches the page with metaKey=true"sv);
+        check(opened_parent_tab == tab, "Command-click reports the active parent tab"sv);
+        check(opened_new_tab != 0, "Command-click reports the engine-created tab"sv);
+        check(opened_activate_tab == 0, "Command-click requests a background tab"sv);
+        if (opened_new_tab != 0)
+            LbTabDestroy(port, opened_new_tab);
+        LbTabDestroy(port, tab);
+    }
+
+    outln("");
     check(LbAppSetPageCallbacks(port, nullptr) == 0, "refusing after tabs exist does not disturb them"sv);
     LbAppDestroy(port);
 
@@ -176,6 +249,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         return 1;
     }
     outln("");
-    outln("PASS: callback groups are size- and version-checked, and a host that registers nothing still gets a live tab");
+    outln("PASS: callback groups are size- and version-checked, and absent request callbacks still leave a live tab");
     return 0;
 }

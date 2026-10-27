@@ -61,7 +61,7 @@ void scroll_wheel_at(WebView::ViewImplementation& view, Web::DevicePixelPoint po
     });
 }
 
-void click_at(WebView::ViewImplementation& view, Web::DevicePixelPoint position)
+void click_at(WebView::ViewImplementation& view, Web::DevicePixelPoint position, Web::UIEvents::KeyModifier modifiers = Web::UIEvents::Mod_None)
 {
     view.enqueue_input_event(Web::MouseEvent {
         .type = Web::MouseEvent::Type::MouseDown,
@@ -69,6 +69,7 @@ void click_at(WebView::ViewImplementation& view, Web::DevicePixelPoint position)
         .screen_position = position,
         .button = Web::UIEvents::MouseButton::Primary,
         .buttons = Web::UIEvents::MouseButton::Primary,
+        .modifiers = modifiers,
         .click_count = 1,
         .browser_data = nullptr,
     });
@@ -77,6 +78,7 @@ void click_at(WebView::ViewImplementation& view, Web::DevicePixelPoint position)
         .position = position,
         .screen_position = position,
         .button = Web::UIEvents::MouseButton::Primary,
+        .modifiers = modifiers,
         .click_count = 1,
         .browser_data = nullptr,
     });
@@ -305,6 +307,34 @@ addEventListener("scroll", () => { document.title = "scrolled to " + scrollY; })
     }
 
     outln("PASS: wheel scrolls the page and a click on a link navigates");
+
+    // A native host must preserve mouse modifiers; otherwise Command-click arrives as an ordinary click. Observe the
+    // modifier in the page so this probe pins the input boundary without depending on a platform tab implementation.
+    paints_since_keyboard_page = 0;
+    auto loads_before_command_click = loads_finished;
+    view->load_html(R"~~~(<!DOCTYPE html>
+<title>command-click-me</title>
+<body style="margin:0">
+<a href="https://example.com/command-click" style="display:block;width:100vw;height:100vh">go</a>
+<script>addEventListener("click", event => { event.preventDefault(); document.title = `command-click:${event.metaKey}`; });</script>
+</body>)~~~"sv);
+
+    if (!spin_until_or_timeout([&] { return loads_finished > loads_before_command_click; }, AK::Duration::from_seconds(30))) {
+        outln("FAIL: the command-click page never finished loading");
+        return 1;
+    }
+    if (!spin_until_or_timeout([&] { return paints_since_keyboard_page > 0; }, AK::Duration::from_seconds(30))) {
+        outln("FAIL: the command-click page never painted");
+        return 1;
+    }
+    click_at(*view, wheel_position, Web::UIEvents::Mod_Super);
+    auto command_modifier_arrived = spin_until_or_timeout([&] { return last_title == "command-click:true"sv; }, AK::Duration::from_seconds(20));
+    outln("COMMAND CLICK: modifier_arrived={} title={}", command_modifier_arrived, last_title);
+    if (!command_modifier_arrived) {
+        outln("FAIL: Command-click did not reach the page with metaKey=true");
+        return 1;
+    }
+    outln("PASS: Command-click reaches the page with metaKey=true");
 
     // -----------------------------------------------------------------------------------------
     // Keyboard. The last engine input path that had never crossed this boundary.
